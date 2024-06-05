@@ -28,6 +28,7 @@
 //! ```
 use crate::{
     CanAddr, CanAnyFrame, CanFdFrame, CanFrame, Error, IoResult, Result, Socket, SocketOptions,
+    Timestamp,
 };
 use futures::{prelude::*, ready, task::Context};
 use mio::{event, unix::SourceFd, Interest, Registry, Token};
@@ -169,12 +170,13 @@ impl CanSocket {
 }
 
 impl Stream for CanSocket {
-    type Item = Result<CanFrame>;
+    type Item = Result<(CanFrame, Option<Timestamp>)>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
         loop {
             let mut ready_guard = ready!(self.0.poll_read_ready(cx))?;
-            match ready_guard.try_io(|inner| inner.get_ref().get_ref().read_frame()) {
+            match ready_guard.try_io(|inner| inner.get_ref().get_ref().read_frame_with_timestamp())
+            {
                 Ok(result) => return Poll::Ready(Some(result.map_err(|e| e.into()))),
                 Err(_would_block) => continue,
             }
@@ -244,12 +246,13 @@ impl Future for CanFdWriteFuture {
 }
 
 impl Stream for CanFdSocket {
-    type Item = Result<CanAnyFrame>;
+    type Item = Result<(CanAnyFrame, Option<Timestamp>)>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
         loop {
             let mut ready_guard = ready!(self.0.poll_read_ready(cx))?;
-            match ready_guard.try_io(|inner| inner.get_ref().get_ref().read_frame()) {
+            match ready_guard.try_io(|inner| inner.get_ref().get_ref().read_frame_with_timestamp())
+            {
                 Ok(result) => return Poll::Ready(Some(result.map_err(|e| e.into()))),
                 Err(_would_block) => continue,
             }

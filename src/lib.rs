@@ -112,6 +112,9 @@ pub use embedded_can::{
     Frame as EmbeddedFrame, Id, StandardId,
 };
 
+mod time;
+pub use time::Timestamp;
+
 pub mod errors;
 pub use errors::{
     CanError, CanErrorDecodingFailure, ConstructionError, Error, IoError, IoErrorKind, IoResult,

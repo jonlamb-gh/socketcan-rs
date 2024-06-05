@@ -14,7 +14,8 @@
 use crate::{
     as_bytes, as_bytes_mut,
     frame::{can_frame_default, canfd_frame_default, AsPtr, CAN_ERR_MASK},
-    CanAddr, CanAnyFrame, CanFdFrame, CanFrame, CanRawFrame, IoError, IoErrorKind, IoResult,
+    time::Timestamp,
+    CanAddr, CanAnyFrame, CanFrame, CanRawFrame, IoError, IoErrorKind, IoResult,
 };
 use libc::{canid_t, socklen_t, AF_CAN, EINPROGRESS};
 use socket2::SockAddr;
@@ -246,6 +247,9 @@ pub trait Socket: AsRawFd {
     /// Blocking read a single can frame.
     fn read_frame(&self) -> IoResult<Self::FrameType>;
 
+    /// Blocking read a single can frame with optional hardware timestamp.
+    fn read_frame_with_timestamp(&self) -> IoResult<(Self::FrameType, Option<Timestamp>)>;
+
     /// Blocking read a single can frame with timeout.
     fn read_frame_timeout(&self, timeout: Duration) -> IoResult<Self::FrameType> {
         use nix::poll::{poll, PollFd, PollFlags};
@@ -438,6 +442,25 @@ pub trait SocketOptions: AsRawFd {
         let join_filters = c_int::from(enabled);
         self.set_socket_option(SOL_CAN_RAW, CAN_RAW_JOIN_FILTERS, &join_filters)
     }
+
+    /// Enable hardware timestamping
+    fn set_timestamps(&self, enabled: bool) -> IoResult<()> {
+        use nix::sys::socket::{setsockopt, TimestampingFlag};
+
+        let ts_flags = if enabled {
+            TimestampingFlag::SOF_TIMESTAMPING_SOFTWARE
+                | TimestampingFlag::SOF_TIMESTAMPING_RX_SOFTWARE
+                | TimestampingFlag::SOF_TIMESTAMPING_RAW_HARDWARE
+        } else {
+            TimestampingFlag::empty()
+        };
+        setsockopt(
+            self.as_raw_fd(),
+            nix::sys::socket::sockopt::Timestamping,
+            &ts_flags,
+        )?;
+        Ok(())
+    }
 }
 
 // TODO: We need to restore this, but preferably with TIMESTAMPING
@@ -484,11 +507,47 @@ impl CanSocket {
 pub struct CanSocket(socket2::Socket);
 
 impl CanSocket {
+    fn alloc_cmsg_space() -> Vec<u8> {
+        use nix::cmsg_space;
+        use nix::sys::time::{TimeSpec, TimeVal};
+        cmsg_space!(TimeVal, TimeSpec, TimeSpec, TimeSpec, u32)
+    }
+
     /// Reads a low-level libc `can_frame` from the socket.
     pub fn read_raw_frame(&self) -> IoResult<libc::can_frame> {
         let mut frame = can_frame_default();
         self.as_raw_socket().read_exact(as_bytes_mut(&mut frame))?;
         Ok(frame)
+    }
+
+    /// Reads a low-level libc `can_frame` and optional hardware timestamp from the socket.
+    pub fn read_raw_frame_with_timestamp(&self) -> IoResult<(libc::can_frame, Option<Timestamp>)> {
+        use nix::sys::socket::recvmsg;
+        use nix::sys::socket::ControlMessageOwned;
+        use nix::sys::socket::MsgFlags;
+        use std::io::IoSliceMut;
+
+        let mut frame = can_frame_default();
+
+        let fd = self.as_raw_fd();
+        let iov = &mut [IoSliceMut::new(as_bytes_mut(&mut frame))];
+        // TODO - consider add some interior mutable Vec to CanSocket
+        // so we don't need to allocate this on each call
+        let mut cmsg_buffer = Self::alloc_cmsg_space();
+
+        let r = recvmsg::<()>(fd, iov, Some(&mut cmsg_buffer), MsgFlags::empty())?;
+
+        let timestamp = r
+            .cmsgs()
+            .next()
+            .and_then(|cmsg| match cmsg {
+                ControlMessageOwned::ScmTimestampns(tspec) => Some(tspec),
+                ControlMessageOwned::ScmTimestampsns(tstamps) => Some(tstamps.hw_raw),
+                _ => None,
+            })
+            .map(Timestamp::from);
+
+        Ok((frame, timestamp))
     }
 }
 
@@ -524,6 +583,12 @@ impl Socket for CanSocket {
     fn read_frame(&self) -> IoResult<CanFrame> {
         let frame = self.read_raw_frame()?;
         Ok(frame.into())
+    }
+
+    /// Reads a normal CAN 2.0 frame with timestamp from the socket.
+    fn read_frame_with_timestamp(&self) -> IoResult<(CanFrame, Option<Timestamp>)> {
+        let (frame, timestamp) = self.read_raw_frame_with_timestamp()?;
+        Ok((frame.into(), timestamp))
     }
 }
 
@@ -581,6 +646,12 @@ impl Write for CanSocket {
 pub struct CanFdSocket(socket2::Socket);
 
 impl CanFdSocket {
+    fn alloc_cmsg_space() -> Vec<u8> {
+        use nix::cmsg_space;
+        use nix::sys::time::{TimeSpec, TimeVal};
+        cmsg_space!(TimeVal, TimeSpec, TimeSpec, TimeSpec, u32)
+    }
+
     // Enable or disable FD mode on a socket.
     fn set_fd_mode(sock: socket2::Socket, enable: bool) -> IoResult<socket2::Socket> {
         let enable = enable as c_int;
@@ -621,6 +692,50 @@ impl CanFdSocket {
             _ => Err(IoError::last_os_error()),
         }
     }
+
+    /// Reads a raw CAN frame with optional hardware timestamp from the socket.
+    ///
+    /// This might be either type of CAN frame, a classic CAN 2.0 frame
+    /// or an FD frame.
+    pub fn read_raw_frame_with_timestamp(&self) -> IoResult<(CanRawFrame, Option<Timestamp>)> {
+        use nix::sys::socket::recvmsg;
+        use nix::sys::socket::ControlMessageOwned;
+        use nix::sys::socket::MsgFlags;
+        use std::io::IoSliceMut;
+
+        let mut fdframe = canfd_frame_default();
+
+        let fd = self.as_raw_fd();
+        let iov = &mut [IoSliceMut::new(as_bytes_mut(&mut fdframe))];
+        // TODO - consider add some interior mutable Vec to CanSocket
+        // so we don't need to allocate this on each call
+        let mut cmsg_buffer = Self::alloc_cmsg_space();
+
+        let r = recvmsg::<()>(fd, iov, Some(&mut cmsg_buffer), MsgFlags::empty())?;
+
+        let timestamp = r
+            .cmsgs()
+            .next()
+            .and_then(|cmsg| match cmsg {
+                ControlMessageOwned::ScmTimestampns(tspec) => Some(tspec),
+                ControlMessageOwned::ScmTimestampsns(tstamps) => Some(tstamps.hw_raw),
+                _ => None,
+            })
+            .map(Timestamp::from);
+
+        match r.bytes {
+            // If we only get 'can_frame' number of bytes, then the return is,
+            // by definition, a can_frame, so we just copy the bytes into the
+            // proper type.
+            CAN_MTU => {
+                let mut frame = can_frame_default();
+                as_bytes_mut(&mut frame)[..CAN_MTU].copy_from_slice(&as_bytes(&fdframe)[..CAN_MTU]);
+                Ok((frame.into(), timestamp))
+            }
+            CANFD_MTU => Ok((fdframe.into(), timestamp)),
+            _ => Err(IoError::last_os_error()),
+        }
+    }
 }
 
 impl Socket for CanFdSocket {
@@ -654,20 +769,14 @@ impl Socket for CanFdSocket {
 
     /// Reads either type of CAN frame from the socket.
     fn read_frame(&self) -> IoResult<CanAnyFrame> {
-        let mut fdframe = canfd_frame_default();
+        let f = self.read_raw_frame()?;
+        Ok(f.into())
+    }
 
-        match self.as_raw_socket().read(as_bytes_mut(&mut fdframe))? {
-            // If we only get 'can_frame' number of bytes, then the return is,
-            // by definition, a can_frame, so we just copy the bytes into the
-            // proper type.
-            CAN_MTU => {
-                let mut frame = can_frame_default();
-                as_bytes_mut(&mut frame)[..CAN_MTU].copy_from_slice(&as_bytes(&fdframe)[..CAN_MTU]);
-                Ok(CanFrame::from(frame).into())
-            }
-            CANFD_MTU => Ok(CanFdFrame::from(fdframe).into()),
-            _ => Err(IoError::last_os_error()),
-        }
+    /// Reads either type of CAN frame with timestamp from the socket.
+    fn read_frame_with_timestamp(&self) -> IoResult<(CanAnyFrame, Option<Timestamp>)> {
+        let (frame, timestamp) = self.read_raw_frame_with_timestamp()?;
+        Ok((frame.into(), timestamp))
     }
 }
 
